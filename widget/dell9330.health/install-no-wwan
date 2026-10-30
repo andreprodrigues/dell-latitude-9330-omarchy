@@ -1,0 +1,17 @@
+#!/bin/bash
+# Keeps the unused MediaTek T700 5G modem (mtk_t7xx, 0000:72:00.0) driverless:
+# its driver times out (-110) on the final hibernate power-off and the kernel
+# rolls the hibernation back. --remove lets it load again on next boot.
+set -euo pipefail
+
+conf=/etc/modprobe.d/dell-health-no-wwan.conf
+
+if [[ ${1:-} == --remove ]]; then
+  sudo rm -f "$conf"
+  echo "Removed $conf; mtk_t7xx loads again after reboot"
+  exit 0
+fi
+
+printf '# Unused 5G modem; its driver blocks hibernation (see dell-health plugin)\nblacklist mtk_t7xx\n' | sudo tee "$conf" >/dev/null
+sudo modprobe -r mtk_t7xx wwan 2>/dev/null || true
+lsmod | grep -qE '^mtk_t7xx ' && echo "mtk_t7xx still loaded" || echo "mtk_t7xx unloaded"

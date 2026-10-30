@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "dell9330.health",
+  "name": "Dell health",
+  "version": "1.0.0",
+  "author": "dell-latitude-9330-omarchy",
+  "license": "MIT",
+  "description": "Health of this Latitude 9330: ControlVault 3 fingerprint stack, s2idle deep sleep, battery.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Dell health",
+    "description": "Fingerprint, deep sleep and battery checks with a detail popup.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 60
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 15,
+        "max": 3600,
+        "step": 15,
+        "defaultValue": 60
+      }
+    ]
+  }
+}

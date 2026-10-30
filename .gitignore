@@ -1,0 +1,4 @@
+*.pkg.tar.zst
+fingerprint/libfprint-tod-cv3/src/
+fingerprint/libfprint-tod-cv3/pkg/
+fingerprint/libfprint-tod-cv3/libfprint/

@@ -1,0 +1,20 @@
+#!/bin/bash
+# Lid close -> suspend-then-hibernate: s2idle first, hibernate after 12h on
+# battery (or below 5% battery). On AC it stays suspended. --remove undoes it.
+set -euo pipefail
+
+sleep_conf=/etc/systemd/sleep.conf.d/dell-health-hibernate.conf
+logind_conf=/etc/systemd/logind.conf.d/dell-health-lid.conf
+
+if [[ ${1:-} == --remove ]]; then
+  sudo rm -f "$sleep_conf" "$logind_conf"
+else
+  sudo install -d -m 0755 /etc/systemd/sleep.conf.d /etc/systemd/logind.conf.d
+  printf '[Sleep]\nHibernateDelaySec=12h\nHibernateOnACPower=no\n' | sudo tee "$sleep_conf" >/dev/null
+  printf '[Login]\nHandleLidSwitch=suspend-then-hibernate\n' | sudo tee "$logind_conf" >/dev/null
+fi
+
+# logind re-reads its config on SIGHUP; no restart of the session manager.
+sudo systemctl kill -s HUP systemd-logind
+sleep 1
+busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitch

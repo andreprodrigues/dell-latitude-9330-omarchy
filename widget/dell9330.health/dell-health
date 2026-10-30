@@ -1,0 +1,298 @@
+#!/bin/bash
+# Health checks for this Dell Latitude 9330 on Omarchy: the ControlVault 3
+# fingerprint stack, s2idle deep sleep, and the battery. Prints JSON for the
+# bar widget; `dell-health --text` prints a readable summary instead.
+# Needs no root. Last-sleep S0ix is derived by sampling the residency counter
+# on every run and matching it against the kernel's suspend entry/exit lines.
+
+set -u
+export LC_ALL=C
+
+state_dir="$HOME/.local/state/dell-health"
+state_file="$state_dir/state.json"
+mkdir -p "$state_dir"
+
+items="[]"
+add() { # section label value status [hint]
+  items=$(jq -c --arg s "$1" --arg l "$2" --arg v "$3" --arg st "$4" --arg h "${5:-}" \
+    '. + [{section:$s,label:$l,value:$v,status:$st,hint:$h}]' <<<"$items")
+}
+
+state=$(cat "$state_file" 2>/dev/null)
+[[ $state == \{* ]] || state="{}"
+now=$(date +%s)
+
+# ---- Fingerprint ------------------------------------------------------------
+
+sensor=no
+for d in /sys/bus/usb/devices/*; do
+  [[ $(cat "$d/idVendor" 2>/dev/null) == 0a5c && $(cat "$d/idProduct" 2>/dev/null) == 5843 ]] && sensor=yes
+done
+if [[ $sensor == yes ]]; then
+  add Fingerprint Sensor "ControlVault 3 (0a5c:5843)" ok
+else
+  add Fingerprint Sensor "not detected" bad "Check BIOS: ControlVault / fingerprint reader enabled"
+fi
+
+if lib=$(pacman -Q libfprint-tod-cv3 2>/dev/null); then
+  add Fingerprint Library "${lib#* } (patched)" ok
+else
+  other=$(pacman -Qq libfprint libfprint-git libfprint-tod 2>/dev/null | head -1)
+  add Fingerprint Library "replaced by ${other:-nothing}" bad "cd ~/.local/src/libfprint-tod-cv3 && makepkg -si"
+fi
+
+if drv=$(pacman -Q libfprint-2-tod1-broadcom 2>/dev/null); then
+  add Fingerprint Driver "Broadcom ${drv#* }" ok
+else
+  add Fingerprint Driver "missing" bad "yay -S libfprint-2-tod1-broadcom"
+fi
+
+shim=/usr/local/lib/libbcm-cv-host-event-shim.so
+if [[ -f $shim ]] && systemctl show fprintd -p Environment 2>/dev/null | grep -q "$shim"; then
+  add Fingerprint Shim "loaded into fprintd" ok
+elif [[ -f $shim ]]; then
+  add Fingerprint Shim "installed, not in fprintd unit" bad "Restore /etc/systemd/system/fprintd.service.d/broadcom-host-event-shim.conf"
+else
+  add Fingerprint Shim "missing" bad "Rebuild ~/.local/src/bcm-cv-host-event-shim"
+fi
+
+if [[ $(systemctl is-active fprintd 2>/dev/null) == active ]]; then
+  add Fingerprint Service "fprintd running" ok
+else
+  add Fingerprint Service "fprintd not running" warn "Starts on demand; sudo systemctl start fprintd"
+fi
+
+# Enrolled fingers are cached for 10 minutes so the bar never queries fprintd
+# more often than that.
+enrolled_at=$(jq -r '.enrolledAt // 0' <<<"$state")
+enrolled=$(jq -r '.enrolled // ""' <<<"$state")
+if (( now - enrolled_at > 600 )) || [[ -z $enrolled ]]; then
+  enrolled=$(timeout 5 fprintd-list "$USER" 2>/dev/null | sed -n 's/^ - #[0-9]*: //p' | sort -u | paste -sd, -)
+  [[ -n $enrolled ]] || enrolled="none"
+  state=$(jq -c --arg e "$enrolled" --argjson t "$now" '.enrolled=$e | .enrolledAt=$t' <<<"$state")
+fi
+if [[ $enrolled == none ]]; then
+  add Fingerprint Enrolled "no fingers" bad "fprintd-enroll -f right-index-finger"
+else
+  add Fingerprint Enrolled "${enrolled//,/, }" ok
+fi
+
+last=$(journalctl -u fprintd -b --no-pager -o short-unix 2>/dev/null | grep 'identify returned' | tail -1)
+if [[ -n $last ]]; then
+  when=$(date -d "@${last%%.*}" +%H:%M)
+  if [[ $last == *"result=1"* ]]; then
+    add Fingerprint "Last scan" "match at $when" ok
+  else
+    add Fingerprint "Last scan" "no match at $when" info
+  fi
+else
+  add Fingerprint "Last scan" "none since boot" info
+fi
+
+missing=()
+grep -q pam_fprintd /etc/pam.d/sudo 2>/dev/null || missing+=(sudo)
+grep -q pam_fprintd /etc/pam.d/polkit-1 2>/dev/null || missing+=(polkit)
+[[ -f /etc/pam.d/omarchy-lock-fingerprint ]] || missing+=(lock)
+if (( ${#missing[@]} == 0 )); then
+  add Fingerprint "Used for" "sudo, polkit, lock screen" ok
+else
+  add Fingerprint "Used for" "missing: ${missing[*]}" warn "Re-run setup-pam.sh"
+fi
+
+# ---- Sleep ------------------------------------------------------------------
+
+if [[ -d /sys/module/vmd ]] && ls /sys/bus/pci/drivers/vmd/0000:* >/dev/null 2>&1; then
+  add Sleep Storage "RAID On (VMD)" bad "BIOS > Storage > AHCI/NVMe, or S0ix never happens"
+else
+  add Sleep Storage "AHCI/NVMe" ok
+fi
+
+residency_file=/sys/devices/system/cpu/cpuidle/low_power_idle_system_residency_us
+residency=$(cat "$residency_file" 2>/dev/null || echo 0)
+boot_id=$(cat /proc/sys/kernel/random/boot_id)
+
+prev_boot=$(jq -r '.bootId // ""' <<<"$state")
+prev_t=$(jq -r '.sampleT // 0' <<<"$state")
+prev_r=$(jq -r '.sampleR // 0' <<<"$state")
+
+# Latest complete suspend this boot (entry and the following exit).
+read -r entry exit_ < <(journalctl -k -b --no-pager -o short-unix 2>/dev/null |
+  awk '/PM: suspend entry/ {e=$1} /PM: suspend exit/ && e {print e, $1; e=""}' | tail -1)
+
+[[ $prev_boot == "$boot_id" ]] || state=$(jq -c 'del(.lastSleep)' <<<"$state")
+
+if [[ -n ${entry:-} ]]; then
+  e=${entry%%.*}; x=${exit_%%.*}
+  recorded=$(jq -r '.lastSleep.entry // 0' <<<"$state")
+  sleeps=$(journalctl -k -b --no-pager -o cat 2>/dev/null | grep -c 'PM: suspend entry')
+  # No sample from this boot yet: with a single suspend so far, the whole
+  # boot's residency belongs to it (the counter barely moves while awake).
+  if [[ $prev_boot != "$boot_id" ]] && (( sleeps == 1 )); then
+    prev_t=0; prev_r=0
+  fi
+  # The sample before the suspend and this one after it bracket the sleep.
+  if [[ $prev_boot == "$boot_id" || $prev_t == 0 ]] && (( e != recorded && prev_t <= e && x <= now && x > e )); then
+    pct=$(( (residency - prev_r) / 10000 / (x - e) ))
+    (( pct > 100 )) && pct=100
+    (( pct < 0 )) && pct=0
+    state=$(jq -c --argjson e "$e" --argjson x "$x" --argjson p "$pct" \
+      '.lastSleep={entry:$e,exit:$x,pct:$p}' <<<"$state")
+  fi
+fi
+
+duration() {
+  local d=$1
+  if (( d >= 3600 )); then echo "$((d / 3600))h$(( d % 3600 / 60 ))m"
+  elif (( d >= 60 )); then echo "$((d / 60))m"
+  else echo "${d}s"; fi
+}
+
+# Exact numbers from the systemd-sleep hook (install-sleep-hook), when present:
+# pair each "pre" line with the following "post" line.
+sleep_log=/var/lib/dell-health/sleep.log
+hook=/usr/lib/systemd/system-sleep/dell-health
+pairs=""
+if [[ -r $sleep_log ]]; then
+  pairs=$(awk '$1=="pre" {p=$0; next}
+    $1=="post" && p!="" {split(p,a," "); print a[3], $3, a[4], $4, a[5], (a[6]+$6)/2, (a[7]||$7), a[8], $8; p=""}' "$sleep_log")
+fi
+# pairs: entry exit charge_pre charge_post charge_full avg_voltage ac s0ix_pre s0ix_post
+
+if [[ -n $pairs ]]; then
+  read -r e x c0 c1 cf v ac r0 r1 <<<"$(tail -1 <<<"$pairs")"
+  dur=$(( x - e ))
+  pct=$(( dur > 0 ? (r1 - r0) / 10000 / dur : 0 ))
+  (( pct > 100 )) && pct=100
+  (( pct < 0 )) && pct=0
+  # suspend-then-hibernate: S0ix residency does not survive the trip through
+  # hibernation, so report when it hibernated instead of a percentage.
+  # -1 marks an attempt the kernel rolled back.
+  # Not -k (it implies the current boot): the sleep may belong to the previous one.
+  hib=$(journalctl _TRANSPORT=kernel --no-pager -o short-unix --since "@$e" --until "@$((x + 1))" 2>/dev/null |
+    awk '/PM: hibernation: hibernation entry/ && !t {t=int($1)} /Wakeup event detected during hibernation/ {rb=1}
+      END {print rb ? -1 : t+0}')
+  state=$(jq -c --argjson e "$e" --argjson x "$x" --argjson p "$pct" --argjson h "${hib:-0}" \
+    '.lastSleep={entry:$e,exit:$x,pct:$p,hibernatedAt:$h}' <<<"$state")
+fi
+
+if [[ $(jq -r '.lastSleep.entry // 0' <<<"$state") != 0 ]]; then
+  pct=$(jq -r '.lastSleep.pct' <<<"$state")
+  e=$(jq -r '.lastSleep.entry' <<<"$state")
+  x=$(jq -r '.lastSleep.exit' <<<"$state")
+  span=$(duration $(( x - e )))
+  hib=$(jq -r '.lastSleep.hibernatedAt // 0' <<<"$state")
+  value="${pct}% deep sleep, ${span} ($(date -d "@$e" '+%a %H:%M'))"
+  if (( hib < 0 )); then
+    add Sleep "Last sleep" "hibernate attempt rolled back ($(date -d "@$e" '+%a %H:%M'))" warn
+  elif (( hib > 0 && hib - e < 60 )); then
+    add Sleep "Last sleep" "hibernated, ${span} ($(date -d "@$e" '+%a %H:%M'))" ok
+  elif (( hib > 0 )); then
+    add Sleep "Last sleep" "${span} ($(date -d "@$e" '+%a %H:%M')), hibernated after $(duration $(( hib - e )))" ok
+  elif (( pct >= 80 )); then add Sleep "Last sleep" "$value" ok
+  elif (( pct >= 30 )); then add Sleep "Last sleep" "$value" warn "Something kept the chip partly awake"
+  else add Sleep "Last sleep" "$value" bad "Not reaching S0ix: check BIOS storage mode, then PMC blockers"
+  fi
+else
+  add Sleep "Last sleep" "none measured yet" info
+fi
+
+# Battery drain while asleep, from the hook's charge/voltage readings.
+if [[ -n $pairs ]]; then
+  read -r e x c0 c1 cf v ac r0 r1 <<<"$(tail -1 <<<"$pairs")"
+  dur=$(( x - e ))
+  if [[ $ac == 1 ]]; then
+    add Sleep "Sleep drain" "on charger" info
+  elif (( dur < 600 )); then
+    add Sleep "Sleep drain" "$(awk -v a="$c0" -v b="$c1" -v f="$cf" 'BEGIN{printf "%.1f%%", (a-b)/f*100}') in $(duration $dur) (too short to rate)" info
+  else
+    read -r drop watts perh days < <(awk -v a="$c0" -v b="$c1" -v f="$cf" -v v="$v" -v d="$dur" 'BEGIN{
+      h=d/3600; wh=(a-b)*v/1e12; w=wh/h
+      printf "%.1f %.2f %.2f %.1f\n", (a-b)/f*100, w, (a-b)/f*100/h, (w>0 ? f*v/1e12/w/24 : 0)}')
+    value="${drop}% in $(duration $dur), ${watts} W (${perh}%/h, ~${days} days standby)"
+    if awk -v p="$perh" 'BEGIN{exit !(p<=1.0)}'; then add Sleep "Sleep drain" "$value" ok
+    elif awk -v p="$perh" 'BEGIN{exit !(p<=3.0)}'; then add Sleep "Sleep drain" "$value" warn "Higher than healthy s2idle (≤1%/h)"
+    else add Sleep "Sleep drain" "$value" bad "Something keeps the laptop awake in sleep"
+    fi
+  fi
+
+  # Seven-day average over battery-only sleeps of at least 10 minutes.
+  avg=$(awk -v since=$(( now - 7 * 86400 )) '$1 >= since && $7 == 0 && $2 - $1 >= 600 {
+      d+=$2-$1; wh+=($3-$4)*$6/1e12; pct+=($3-$4)/$5*100; n++ }
+    END { if (n) printf "%.2f W, %.2f%%/h over %d sleeps", wh/(d/3600), pct/(d/3600), n }' <<<"$pairs")
+  [[ -n $avg ]] && add Sleep "7-day drain" "$avg" info
+elif [[ -x $hook ]]; then
+  add Sleep "Sleep drain" "waiting for the next sleep" info
+else
+  add Sleep "Sleep drain" "not tracked" info "Run install-sleep-hook in the plugin folder"
+fi
+
+add Sleep "S0ix this boot" "$(( residency / 1000000 / 60 )) min" info
+add Sleep Mode "$(grep -o '\[[a-z0-9]*\]' /sys/power/mem_sleep | tr -d '[]')" info
+
+# Hibernation: the 5G modem driver (mtk_t7xx) times out on the final power-off
+# and makes the kernel roll hibernation back, so it must stay unloaded.
+hib_log=$(journalctl -k -b --no-pager -o cat 2>/dev/null | grep -E 'PM: hibernation: (hibernation entry|Wakeup event detected)|PM: Image saving done' | tail -3)
+if lsmod | grep -qE '^mtk_t7xx '; then
+  add Sleep Hibernation "5G modem driver loaded" warn "It blocks hibernation: run install-no-wwan in the plugin folder"
+elif grep -q 'Wakeup event detected' <<<"$(tail -1 <<<"$hib_log")"; then
+  add Sleep Hibernation "last attempt rolled back" bad "journalctl -b -k | grep -B5 'Wakeup event detected' shows the device"
+elif [[ -n $hib_log ]]; then
+  add Sleep Hibernation "image written this boot" ok
+else
+  add Sleep Hibernation "ready (modem driver off)" ok
+fi
+
+lid=$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitch 2>/dev/null | awk -F'"' '{print $2}')
+delay=$(systemd-analyze cat-config systemd/sleep.conf 2>/dev/null | sed -n 's/^HibernateDelaySec=//p' | tail -1)
+if [[ $lid == suspend-then-hibernate ]]; then
+  add Sleep "Lid close" "suspend, hibernate after ${delay:-2h} on battery" info
+else
+  add Sleep "Lid close" "${lid:-unknown}" info
+fi
+
+state=$(jq -c --arg b "$boot_id" --argjson t "$now" --argjson r "$residency" \
+  '.bootId=$b | .sampleT=$t | .sampleR=$r' <<<"$state")
+
+# ---- Battery ----------------------------------------------------------------
+
+bat=$(upower -e 2>/dev/null | grep -m1 BAT)
+if [[ -n $bat ]]; then
+  info=$(upower -i "$bat")
+  field() { awk -F': *' -v k="$1" '$1 ~ "^ *"k"$" {print $2; exit}' <<<"$info"; }
+  pctb=$(field percentage); bstate=$(field state); rate=$(field energy-rate)
+  cap=$(field capacity); cap=${cap%\%}
+  charge="$pctb, $bstate"
+  [[ $bstate == discharging && -n $rate ]] && charge+=", $(printf '%.1f W' "${rate% W}")"
+  tte=$(field "time to empty"); [[ $bstate == discharging && -n $tte ]] && charge+=", $tte left"
+  add Battery Charge "$charge" info
+  capi=$(printf '%.0f' "${cap:-0}")
+  if (( capi >= 80 )); then add Battery Health "${capi}% of design" ok
+  elif (( capi >= 60 )); then add Battery Health "${capi}% of design" warn
+  else add Battery Health "${capi}% of design" bad "Battery is worn"
+  fi
+fi
+limit=$(cat /sys/class/power_supply/BAT0/charge_control_end_threshold 2>/dev/null)
+[[ -n $limit ]] && add Battery "Charge limit" "${limit}%" info
+command -v powerprofilesctl >/dev/null && add Battery Profile "$(powerprofilesctl get 2>/dev/null)" info
+
+# ---- System -----------------------------------------------------------------
+
+add System BIOS "$(cat /sys/class/dmi/id/bios_version) ($(cat /sys/class/dmi/id/bios_date))" info
+cv=$(journalctl -u fprintd --no-pager -o cat 2>/dev/null | sed -n 's/^Current AAI Version = //p' | tail -1)
+add System "ControlVault fw" "${cv:-unknown}" info
+add System Kernel "$(uname -r)" info
+
+printf '%s\n' "$state" > "$state_file.tmp" && mv "$state_file.tmp" "$state_file"
+
+# ---- Output -----------------------------------------------------------------
+
+overall=$(jq -r 'if any(.status=="bad") then "bad" elif any(.status=="warn") then "warn" else "ok" end' <<<"$items")
+problems=$(jq -r '[.[] | select(.status=="bad" or .status=="warn") | "\(.label): \(.value)"] | join("; ")' <<<"$items")
+
+if [[ ${1:-} == --text ]]; then
+  jq -r 'group_by(.section)[] | "\n\(.[0].section)", (.[] | "  [\(.status)] \(.label): \(.value)\(if .hint != "" then "  -> " + .hint else "" end)")' <<<"$items"
+  echo; echo "overall: $overall"
+else
+  jq -c --arg o "$overall" --arg p "$problems" --argjson t "$now" \
+    '{status:$o, problems:$p, checkedAt:$t, items:.}' <<<"$items"
+fi

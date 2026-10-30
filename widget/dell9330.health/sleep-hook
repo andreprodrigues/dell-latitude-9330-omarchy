@@ -1,0 +1,29 @@
+#!/bin/bash
+# systemd-sleep hook for the dell-health widget. Installed (by
+# install-sleep-hook) as /usr/lib/systemd/system-sleep/dell-health.
+# Appends one line at suspend ("pre") and resume ("post"):
+#   <pre|post> <action> <epoch> <charge_now µAh> <charge_full µAh> <voltage_now µV> <ac 0|1> <s0ix residency µs>
+# Reads sysfs only; the log is world-readable and trimmed to 400 lines.
+
+log_dir=/var/lib/dell-health
+log=$log_dir/sleep.log
+bat=/sys/class/power_supply/BAT0
+
+[[ $1 == pre || $1 == post ]] || exit 0
+
+mkdir -p "$log_dir"
+chmod 755 "$log_dir"
+
+read_or_zero() { cat "$1" 2>/dev/null || echo 0; }
+
+printf '%s %s %s %s %s %s %s %s\n' \
+  "$1" "${SYSTEMD_SLEEP_ACTION:-$2}" "$(date +%s)" \
+  "$(read_or_zero $bat/charge_now)" "$(read_or_zero $bat/charge_full)" \
+  "$(read_or_zero $bat/voltage_now)" "$(read_or_zero /sys/class/power_supply/AC/online)" \
+  "$(read_or_zero /sys/devices/system/cpu/cpuidle/low_power_idle_system_residency_us)" >> "$log"
+
+if (( $(wc -l < "$log") > 400 )); then
+  tail -n 400 "$log" > "$log.tmp" && mv "$log.tmp" "$log"
+fi
+chmod 644 "$log"
+exit 0

@@ -1,0 +1,15 @@
+#!/bin/bash
+# Installs (or with --remove, removes) the dell-health systemd-sleep hook.
+set -euo pipefail
+
+target=/usr/lib/systemd/system-sleep/dell-health
+
+if [[ ${1:-} == --remove ]]; then
+  sudo rm -f "$target"
+  echo "Removed $target (log kept in /var/lib/dell-health)"
+  exit 0
+fi
+
+sudo install -o root -g root -m 0755 "$(dirname "$(readlink -f "$0")")/sleep-hook" "$target"
+sudo install -d -m 0755 /var/lib/dell-health
+echo "Installed $target"

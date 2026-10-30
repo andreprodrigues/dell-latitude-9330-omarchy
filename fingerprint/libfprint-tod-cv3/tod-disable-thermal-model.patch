@@ -1,0 +1,16 @@
+--- a/libfprint/tod/tod-shared-loader.c
++++ b/libfprint/tod/tod-shared-loader.c
+@@ -136,6 +136,13 @@
+             goodix_tod_wrapper_init (cls);
+         }
+ 
++      /* TOD v1 drivers predate the temperature model; the field sits in what
++       * was zeroed padding for them, so they silently get the 3 min default and
++       * long waits (lock screen, enroll) fail with "Device disabled to prevent
++       * overheating". They are match-on-chip readers: disable the model. */
++      if (cls->temp_hot_seconds == 0)
++        cls->temp_hot_seconds = -1;
++
+       shared_modules = g_list_prepend (shared_modules,
+                                        g_steal_pointer (&module));
+     }
