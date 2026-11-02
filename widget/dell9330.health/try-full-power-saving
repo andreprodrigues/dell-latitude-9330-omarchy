@@ -1,0 +1,13 @@
+#!/bin/bash
+# Turns the panel's full power saving (PSR2) back on until the next reboot, to
+# check whether a newer kernel has fixed the cursor stutter. Move the pointer
+# around for a minute: if it stutters, reboot (or run with --back); if it's
+# smooth, run install-smooth-cursor --remove to keep full power saving.
+set -euo pipefail
+
+mode=0 msg="Full power saving on until reboot. Stutter? Run: $0 --back"
+[[ ${1:-} == --back ]] && mode=3 msg="Back to smooth-cursor mode"
+
+sudo sh -c 'for f in /sys/kernel/debug/dri/*/i915_edp_psr_debug; do echo '"$mode"' > "$f"; exit; done'
+"$(dirname "$(readlink -f "$0")")/dell-health" --psr-tested
+echo "$msg"

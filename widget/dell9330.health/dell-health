@@ -20,6 +20,12 @@ add() { # section label value status [hint]
 
 state=$(cat "$state_file" 2>/dev/null)
 [[ $state == \{* ]] || state="{}"
+
+# try-full-power-saving calls this after a re-test, so the Screen hint clears.
+if [[ ${1:-} == --psr-tested ]]; then
+  jq -c --arg k "$(uname -r)" '.psrTestedKernel=$k' <<<"$state" > "$state_file"
+  exit 0
+fi
 now=$(date +%s)
 
 # ---- Fingerprint ------------------------------------------------------------
@@ -281,6 +287,24 @@ add System BIOS "$(cat /sys/class/dmi/id/bios_version) ($(cat /sys/class/dmi/id/
 cv=$(journalctl -u fprintd --no-pager -o cat 2>/dev/null | sed -n 's/^Current AAI Version = //p' | tail -1)
 add System "ControlVault fw" "${cv:-unknown}" info
 add System Kernel "$(uname -r)" info
+
+# Screen: the panel's full power saving (PSR2) makes the cursor stutter, so
+# the kernel is told to use the lighter mode (PSR1, i915.enable_psr=1). Kernel
+# updates sometimes fix PSR2, so after one, offer a re-test until it's done.
+if grep -qw 'i915.enable_psr=1' /proc/cmdline; then
+  tested=$(jq -r '.psrTestedKernel // empty' <<<"$state")
+  if [[ -z $tested ]]; then
+    tested=$(uname -r)
+    state=$(jq -c --arg k "$tested" '.psrTestedKernel=$k' <<<"$state")
+  fi
+  if [[ $tested == "$(uname -r)" ]]; then
+    add System Screen "smooth-cursor mode" ok
+  else
+    add System Screen "smooth-cursor mode (new kernel)" info "Full power saving may work now: run try-full-power-saving in the plugin folder"
+  fi
+else
+  add System Screen "full power saving" info "If the cursor stutters: run install-smooth-cursor in the plugin folder"
+fi
 
 printf '%s\n' "$state" > "$state_file.tmp" && mv "$state_file.tmp" "$state_file"
 

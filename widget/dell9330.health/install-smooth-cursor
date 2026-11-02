@@ -1,0 +1,17 @@
+#!/bin/bash
+# Stops cursor stutter: tells the kernel to use the panel's lighter power
+# saving mode (PSR1) instead of the full one (PSR2). Takes effect after a
+# reboot and costs about 0.1 W. --remove goes back to full power saving.
+set -euo pipefail
+
+conf=/etc/limine-entry-tool.d/dell-psr1.conf
+
+if [[ ${1:-} == --remove ]]; then
+  sudo rm -f "$conf"
+else
+  printf '%s\n' '# Lighter panel power saving (PSR1): full PSR2 makes the cursor stutter.' \
+    'KERNEL_CMDLINE[default]+=" i915.enable_psr=1"' | sudo tee "$conf" >/dev/null
+fi
+
+sudo limine-mkinitcpio >/dev/null
+echo "Boot entries updated; reboot to apply"

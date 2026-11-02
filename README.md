@@ -1,8 +1,9 @@
-# Dell Latitude 9330 on Omarchy: fingerprint, deep sleep, hibernate
+# Dell Latitude 9330 on Omarchy: fingerprint, deep sleep, hibernate, smooth cursor
 
 Fixes that got a Dell Latitude 9330 fully working on [Omarchy](https://omarchy.org)
-(Arch Linux): the Broadcom fingerprint reader, s2idle deep sleep and
-suspend-then-hibernate. A bar widget checks all of them.
+(Arch Linux): the Broadcom fingerprint reader, s2idle deep sleep,
+suspend-then-hibernate, a stutter-free cursor and a better-feeling touchpad.
+A bar widget checks all of them.
 
 Each section starts with the symptom, so you can jump to what you're seeing.
 The fingerprint part should also apply to other Dells with the same
@@ -20,7 +21,8 @@ hibernates and restores the session.
 | Folder | What it is |
 |---|---|
 | [`fingerprint/`](fingerprint) | Patched libfprint-tod PKGBUILD, fprintd overrides, install and PAM scripts |
-| [`widget/dell9330.health/`](widget/dell9330.health) | omarchy-shell bar widget, plus install scripts for the sleep and hibernate settings |
+| [`touchpad/`](touchpad) | Touchpad speed settings to paste into Hyprland's config |
+| [`widget/dell9330.health/`](widget/dell9330.health) | omarchy-shell bar widget, plus install scripts for the sleep, hibernate and cursor fixes |
 
 ---
 
@@ -158,6 +160,67 @@ lock screen for a few seconds while the image is written. That's normal.
 
 ---
 
+## Cursor stutter
+
+### Symptom: the mouse pointer hitches or skips, especially when it starts moving
+
+It isn't the touchpad. A good test: draw slow circles on the touchpad. If the
+pointer moves smoothly most of the time but now and then catches for a
+moment, this is probably the cause.
+
+To save power, the screen stops refreshing while nothing on it changes, and
+it has to wake up again when something moves. This laptop's screen
+supports two versions of that. The newer, more aggressive one (PSR2) makes
+the pointer stutter here. The older one (PSR1) is just as smooth as turning
+power saving off completely, and still saves most of the power.
+
+**Fix:** use the older mode. The script adds a boot option and rebuilds the
+boot image, so reboot afterwards:
+
+```sh
+widget/dell9330.health/install-smooth-cursor                 # --remove to undo
+```
+
+**The cost is small.** Over 10 minutes of alternating between the two modes on
+the same idle screen, the newer mode used about 0.1 W less (5.03 W against
+5.16 W), within the normal ups and downs of the reading. On a full charge that's
+roughly 10 to 15 minutes less battery life, out of about 8 hours.
+
+**Kernel updates may fix the newer mode.** After a kernel update, the widget
+offers a quick re-test. The re-test turns full power saving back on until the
+next reboot:
+
+```sh
+widget/dell9330.health/try-full-power-saving                 # --back to undo it right away
+```
+
+Move the pointer around for a minute. If it's smooth, keep full power saving
+with `install-smooth-cursor --remove`. If it stutters, just reboot.
+
+---
+
+## Touchpad feel
+
+Omarchy's default pointer speed felt sluggish on this touchpad, and the usual
+acceleration made it jumpy and hard to aim. [`touchpad/touchpad.lua`](touchpad/touchpad.lua)
+replaces the acceleration with a hand-tuned curve:
+
+- **Slow and normal movements always move the pointer the same amount.**
+  Aiming is precise, and a circle drawn on the touchpad comes out as the same
+  circle on screen every time.
+- **Only quick flicks get a boost** (up to 6×), so crossing the screen
+  takes one swipe.
+
+Paste the file's contents at the end of `~/.config/hypr/input.lua`. It takes
+effect as soon as you save. It only changes the built-in touchpad, not
+external mice. To undo it, delete the block.
+
+> [!TIP]
+> Fix [cursor stutter](#cursor-stutter) first. Stutter makes any speed setting
+> feel wrong.
+
+---
+
 ## Health widget
 
 An omarchy-shell bar widget with a detail panel, so you can see at a glance
@@ -170,7 +233,8 @@ package:
   sleep (%/hour, W, estimated standby days), 7-day average, whether
   hibernation is ready.
 - **Battery and system:** charge, health, charge limit, BIOS and
-  ControlVault firmware versions.
+  ControlVault firmware versions, and whether the cursor-stutter fix is on.
+  After a kernel update it suggests re-testing full screen power saving.
 
 Every failed check shows a hint with the command that fixes it.
 
